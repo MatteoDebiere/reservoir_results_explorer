@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { BarChart3, Database, Search } from "lucide-react";
+import { BarChart3, Search } from "lucide-react";
 import data from "./data/reservoir_explorer_data.json";
 import "./styles.css";
 
@@ -9,6 +9,11 @@ const METRIC_LABELS = {
   nse: "NSE",
   mae_norm: "Norm. MAE",
   rmse_norm: "Norm. RMSE",
+};
+const CONFIG_LABELS = {
+  units: "Units",
+  d: "Dropout",
+  lr: "LR",
 };
 const SPLIT_OPTIONS = [
   { key: "in_test", label: "In-test", summaryLabel: "Best in-test model", timeseriesLabel: "In-test time series" },
@@ -22,6 +27,12 @@ function fmtNumber(value, digits = 2) {
 
 function shortDate(value) {
   return value ? String(value).slice(0, 10) : "n/a";
+}
+
+function displayConfigValue(value) {
+  return String(value)
+    .replace(/\\?\(?10\^\{-3\}\\?\)?/g, "0.001")
+    .replace(/\\?\(?10\^-3\\?\)?/g, "0.001");
 }
 
 function searchText(reservoir) {
@@ -38,7 +49,7 @@ function searchText(reservoir) {
 
 function firstReservoirWithSeries(split) {
   return (
-    data.reservoirs.find((reservoir) => reservoir.timeSeriesBySplit?.[split]?.length) ||
+    data.reservoirs.find((reservoir) => reservoirHasSeries(reservoir, split)) ||
     data.reservoirs[0]
   );
 }
@@ -47,12 +58,13 @@ function App() {
   const [split, setSplit] = useState("in_test");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(firstReservoirWithSeries("in_test").id);
+  const [selectedModelChoice, setSelectedModelChoice] = useState(null);
   const splitOption = SPLIT_OPTIONS.find((option) => option.key === split);
 
   const searchableReservoirs = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return data.reservoirs
-      .filter((reservoir) => reservoir.timeSeriesBySplit?.[split]?.length)
+      .filter((reservoir) => reservoirHasSeries(reservoir, split))
       .filter((reservoir) => !normalized || searchText(reservoir).includes(normalized))
       .slice(0, 40);
   }, [query, split]);
@@ -73,21 +85,38 @@ function App() {
   const bestSummary = summaryRows.reduce((winner, row) =>
     Number(row.in_test_median_kge) > Number(winner.in_test_median_kge) ? row : winner,
   );
-  const predictionModel = data.metadata.predictionModel;
   const selectedModels = selected.modelsBySplit?.[split] || [];
-  const selectedSeries = selected.timeSeriesBySplit?.[split] || [];
   const selectedSplit = splitStats(selected, split);
+  const bestKge = Math.max(
+    ...selectedModels.map((model) => Number(model.kge)).filter(Number.isFinite),
+  );
+  const bestModel =
+    selectedModels.find((model) => Number(model.kge) === bestKge) ||
+    selectedModels[0] ||
+    null;
+  const selectedModelRunId =
+    selectedModelChoice?.reservoirId === selected.id && selectedModelChoice?.split === split
+      ? selectedModelChoice.runId
+      : null;
+  const selectedModel =
+    selectedModels.find((model) => model.run_id === selectedModelRunId) ||
+    bestModel;
+  const selectedSeries = timeSeriesForModel(selected, split, selectedModel?.run_id);
+
+  useEffect(() => {
+    setSelectedModelChoice({
+      reservoirId: selected.id,
+      split,
+      runId: bestModel?.run_id || null,
+    });
+  }, [selected.id, split, bestModel?.run_id]);
 
   return (
     <main className="demo-card">
       <header className="card-header">
         <div>
-          <p className="eyebrow">Reservoir operation model</p>
-          <h1>Predicted vs observed releases</h1>
-        </div>
-        <div className="mini-stat">
-          <Database size={16} aria-hidden="true" />
-          <span>{data.metadata.reservoirCount} reservoirs</span>
+          <p className="eyebrow">Modelling Historical Reservoir Releases with Recurrent Deep Learning Methods</p>
+          <h1>Results explorer</h1>
         </div>
       </header>
 
@@ -141,19 +170,71 @@ function App() {
         </div>
       </section>
 
-      <TimeSeriesChart series={selectedSeries} splitLabel={splitOption} predictionModel={predictionModel} />
+      <TimeSeriesChart series={selectedSeries} splitLabel={splitOption} selectedModel={selectedModel} />
 
       <section className="model-grid" aria-label={`${splitOption.label} model metrics`}>
         {selectedModels.map((model) => (
-          <ModelMetric key={model.run_id} model={model} />
+          <ModelMetric
+            key={model.run_id}
+            model={model}
+            isBestKge={Number(model.kge) === bestKge}
+            isSelected={model.run_id === selectedModel?.run_id}
+            onSelect={() =>
+              setSelectedModelChoice({
+                reservoirId: selected.id,
+                split,
+                runId: model.run_id,
+              })
+            }
+          />
         ))}
       </section>
     </main>
   );
 }
 
+function reservoirHasSeries(reservoir, split) {
+  return Boolean(
+    reservoir.timeSeriesBySplit?.[split]?.length ||
+      Object.keys(reservoir.timeSeriesBySplitAndModel?.[split] || {}).length,
+  );
+}
+
 function splitStats(reservoir, split) {
   return reservoir.splits?.find((item) => item.split === split);
+}
+
+function timeSeriesForModel(reservoir, split, runId) {
+  const byModel = reservoir.timeSeriesBySplitAndModel?.[split] || {};
+  return byModel[runId] || reservoir.timeSeriesBySplit?.[split] || [];
+}
+
+function configRows(model) {
+  const [architectureSegment = "", ...parameterSegments] = String(model.configuration || "")
+    .split(",")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const architectureParts = architectureSegment.split(/\s+/).filter(Boolean);
+  const units = architectureParts.length > 1 ? architectureParts.at(-1) : null;
+  const architecture = architectureParts.length > 1
+    ? architectureParts.slice(0, -1).join(" ")
+    : model.architecture_label;
+  const parsed = { architecture, units };
+
+  parameterSegments.forEach((segment) => {
+    const [key, ...valueParts] = segment.split("=");
+    const normalizedKey = key?.trim();
+    const value = valueParts.join("=").trim();
+    if (normalizedKey && value) parsed[normalizedKey] = value;
+  });
+
+  return ["units", "d", "lr"]
+    .filter((key) => parsed[key])
+    .map((key) => ({
+      key,
+      label: CONFIG_LABELS[key] || key,
+      value: displayConfigValue(parsed[key]),
+    }));
 }
 
 function MetricPill({ icon, label, value }) {
@@ -166,7 +247,7 @@ function MetricPill({ icon, label, value }) {
   );
 }
 
-function TimeSeriesChart({ series, splitLabel, predictionModel }) {
+function TimeSeriesChart({ series, splitLabel, selectedModel }) {
   const width = 720;
   const height = 220;
   const padding = { top: 14, right: 16, bottom: 30, left: 38 };
@@ -187,6 +268,10 @@ function TimeSeriesChart({ series, splitLabel, predictionModel }) {
 
   const observedPath = series.map((point, index) => pointFor(point, index, "observed")).join(" ");
   const predictedPath = series.map((point, index) => pointFor(point, index, "predicted")).join(" ");
+  const selectedModelLabel =
+    selectedModel?.architecture_label ||
+    selectedModel?.architectureLabel ||
+    "selected model";
 
   return (
     <section className="chart-panel" aria-label="Monthly observed and predicted release series">
@@ -195,7 +280,8 @@ function TimeSeriesChart({ series, splitLabel, predictionModel }) {
           <h2>{splitLabel.timeseriesLabel}</h2>
           <p>
             Monthly mean normalised release, 2016-2020 · predictions from{" "}
-            {predictionModel.architectureLabel} ({predictionModel.description}) · {splitLabel.label}
+            <strong>{selectedModelLabel}</strong>
+            {selectedModel?.kge !== undefined ? ` · KGE ${fmtNumber(selectedModel.kge, 2)}` : ""} · {splitLabel.label}
           </p>
         </div>
         <div className="legend">
@@ -218,14 +304,41 @@ function TimeSeriesChart({ series, splitLabel, predictionModel }) {
   );
 }
 
-function ModelMetric({ model }) {
+function ModelMetric({ model, isBestKge, isSelected, onSelect }) {
+  const selectWithKeyboard = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onSelect();
+    }
+  };
+
   return (
-    <article className="model-card">
-      <div>
+    <article
+      className={`model-card${isBestKge ? " best-kge" : ""}${isSelected ? " is-selected" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-pressed={isSelected}
+      aria-label={`${model.architecture_label} model metrics${isBestKge ? ", best KGE" : ""}${isSelected ? ", selected" : ""}`}
+      onClick={onSelect}
+      onKeyDown={selectWithKeyboard}
+    >
+      <div className="model-card-heading">
         <strong>{model.architecture_label}</strong>
-        <span>{model.configuration}</span>
+        {isSelected && <span className="selected-pill">Selected</span>}
       </div>
-      <dl>
+
+      <table className="config-table" aria-label={`${model.architecture_label} configuration`}>
+        <tbody>
+          {configRows(model).map((row) => (
+            <tr key={row.key}>
+              <th scope="row">{row.label}</th>
+              <td>{row.value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <dl className="metric-list">
         {["kge", "nse", "mae_norm", "rmse_norm"].map((key) => (
           <React.Fragment key={key}>
             <dt>{METRIC_LABELS[key]}</dt>
